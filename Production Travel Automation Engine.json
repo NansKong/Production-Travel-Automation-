@@ -1,0 +1,1035 @@
+{
+  "name": "Production Travel Automation Engine",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "travel-request",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": false
+        }
+      },
+      "id": "7676f475-d3cc-4aec-9601-940c9c14b8ed",
+      "name": "01 | Webhook Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -4768,
+        176
+      ],
+      "webhookId": "tour-passion-main-001"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─── INPUT NORMALIZER & VALIDATOR ───────────────────────────────────────────\n// Validates and normalizes all incoming webhook fields.\n// Throws structured error if required fields are missing.\n\nconst body = $input.first().json.body;\n\nconst required = ['client_name','client_email','destination','travel_dates','budget','trip_type','num_travelers'];\nconst missing = required.filter(f => !body[f] || String(body[f]).trim() === '');\nif (missing.length > 0) {\n  throw new Error(`VALIDATION_ERROR: Missing required fields: ${missing.join(', ')}`);\n}\n\n// Parse and sanitize\nconst numTravelers = parseInt(body.num_travelers) || 1;\nconst budgetRaw = parseFloat(String(body.budget).replace(/[^0-9.]/g,'')) || 0;\nif (budgetRaw < 100) throw new Error('VALIDATION_ERROR: Budget too low or invalid.');\n\n// Detect date range\nconst dateParts = String(body.travel_dates).split(' to ');\nconst startDate = dateParts[0] ? dateParts[0].trim() : body.travel_dates;\nconst endDate = dateParts[1] ? dateParts[1].trim() : startDate;\nconst start = new Date(startDate);\nconst end = new Date(endDate);\nconst numDays = Math.max(1, Math.round((end - start) / (1000*60*60*24)) + 1);\n\n// Budget tier classification\nlet budgetTier;\nconst budgetPerPersonPerDay = budgetRaw / numTravelers / numDays;\nif (budgetPerPersonPerDay < 80) budgetTier = 'budget';\nelse if (budgetPerPersonPerDay < 200) budgetTier = 'mid-range';\nelse if (budgetPerPersonPerDay < 500) budgetTier = 'premium';\nelse budgetTier = 'luxury';\n\n// Month-based season\nconst month = start.getMonth() + 1;\nlet season;\nif ([6,7,8,12,1].includes(month)) season = 'peak';\nelse if ([3,4,5,9,10].includes(month)) season = 'shoulder';\nelse season = 'off-peak';\n\nconst seasonMultiplierMap = { peak: 1.25, shoulder: 1.10, 'off-peak': 0.92 };\n\nconst requestId = `REQ-${Date.now()}-${Math.random().toString(36).substring(2,7).toUpperCase()}`;\n\nreturn [{\n  json: {\n    requestId,\n    client: {\n      name: String(body.client_name).trim(),\n      email: String(body.client_email).trim().toLowerCase(),\n      preferences: String(body.preferences || 'None specified').trim()\n    },\n    trip: {\n      destination: String(body.destination).trim(),\n      travel_dates: String(body.travel_dates).trim(),\n      start_date: startDate,\n      end_date: endDate,\n      num_days: numDays,\n      trip_type: String(body.trip_type).trim(),\n      num_travelers: numTravelers\n    },\n    financial: {\n      budget_total: budgetRaw,\n      budget_per_person: Math.round(budgetRaw / numTravelers),\n      budget_per_person_per_day: Math.round(budgetPerPersonPerDay),\n      budget_tier: budgetTier,\n      currency: 'USD'\n    },\n    meta: {\n      season,\n      seasonal_multiplier: seasonMultiplierMap[season],\n      received_at: new Date().toISOString(),\n      status: 'processing'\n    }\n  }\n}];\n"
+      },
+      "id": "756a8bc0-6b28-447b-aa07-62662de98703",
+      "name": "02 | Input Normalizer & Validator",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -4528,
+        176
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO clients (name, email, created_at, updated_at)\nVALUES ('{{ $json.client.name }}', '{{ $json.client.email }}', NOW(), NOW())\nON CONFLICT (email) DO UPDATE SET\n  name = EXCLUDED.name,\n  updated_at = NOW()\nRETURNING id, name, email, created_at;",
+        "options": {}
+      },
+      "id": "fe1caa07-2213-49cb-af69-580c79eec5d9",
+      "name": "03 | Upsert Client Record",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        -4288,
+        176
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "c5UZ7YQKkPSsyEnL",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  vr.destination,\n  vr.hotel_category,\n  vr.hotel_rate_per_night,\n  vr.transport_type,\n  vr.transport_cost_per_day,\n  vr.activity_avg_cost_per_day,\n  vr.meal_cost_per_day,\n  vr.guide_cost_per_day,\n  v.vendor_name,\n  v.vendor_email,\n  v.vendor_category,\n  v.sla_hours\nFROM vendor_rates vr\nJOIN vendors v ON v.id = vr.vendor_id\nWHERE LOWER(vr.destination) ILIKE LOWER('%{{ $('02 | Input Normalizer & Validator').item.json.trip.destination }}%')\n  AND vr.budget_tier = '{{ $('02 | Input Normalizer & Validator').item.json.financial.budget_tier }}'\n  AND vr.is_active = true\nORDER BY vr.hotel_category ASC;",
+        "options": {}
+      },
+      "id": "b8e3b831-bbe3-4c8f-ad36-5b89a81a81a7",
+      "name": "04 | Fetch Vendor Rates from DB",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        -4080,
+        176
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "c5UZ7YQKkPSsyEnL",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─── RATE AGGREGATOR ────────────────────────────────────────────────────────\n// Merges DB vendor rates with normalized trip data.\n// Falls back to conservative estimates if no DB data found.\n\nconst tripData = $('02 | Input Normalizer & Validator').item.json;\nconst dbRates = $input.all().map(i => i.json);\n\nlet hotelRate, transportRate, activityRate, mealRate, guideRate;\nlet vendorsFound = [];\n\nif (dbRates.length > 0) {\n  const r = dbRates[0];\n  hotelRate = parseFloat(r.hotel_rate_per_night) || 120;\n  transportRate = parseFloat(r.transport_cost_per_day) || 40;\n  activityRate = parseFloat(r.activity_avg_cost_per_day) || 60;\n  mealRate = parseFloat(r.meal_cost_per_day) || 50;\n  guideRate = parseFloat(r.guide_cost_per_day) || 80;\n  vendorsFound = dbRates.map(r => ({\n    name: r.vendor_name,\n    email: r.vendor_email,\n    category: r.vendor_category,\n    sla_hours: r.sla_hours || 24\n  }));\n} else {\n  // Fallback estimates by budget tier\n  const fallbacks = {\n    budget:    { hotel: 60,  transport: 20, activity: 30, meal: 25, guide: 40 },\n    'mid-range':{ hotel: 120, transport: 40, activity: 60, meal: 50, guide: 80 },\n    premium:   { hotel: 280, transport: 80, activity: 120, meal: 100, guide: 150 },\n    luxury:    { hotel: 600, transport: 180, activity: 300, meal: 200, guide: 300 }\n  };\n  const f = fallbacks[tripData.financial.budget_tier] || fallbacks['mid-range'];\n  hotelRate = f.hotel; transportRate = f.transport;\n  activityRate = f.activity; mealRate = f.meal; guideRate = f.guide;\n}\n\nreturn [{\n  json: {\n    ...tripData,\n    rates: {\n      hotel_per_night: hotelRate,\n      transport_per_day: transportRate,\n      activity_per_day: activityRate,\n      meal_per_day: mealRate,\n      guide_per_day: guideRate\n    },\n    vendors: vendorsFound,\n    rates_source: dbRates.length > 0 ? 'database' : 'fallback_estimates'\n  }\n}];\n"
+      },
+      "id": "e7dcab01-b496-4631-9810-ab5ae0e73a2e",
+      "name": "05 | Rate Aggregator",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -3872,
+        176
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.status }}",
+              "rightValue": "failed",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              },
+              "id": "6133d431-2019-4710-ba30-3a0da3a526a1"
+            }
+          ],
+          "combinator": "or"
+        },
+        "options": {}
+      },
+      "id": "1fa1abf7-861c-4862-8f89-7126ea9b7666",
+      "name": "07 | Replicate Error Check",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        -2528,
+        144
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─── ITINERARY PARSER ──────────────────────────────────────────────────────\n// Parses Replicate gpt-4.1-mini response.\n// Replicate returns output as an ARRAY of string chunks — must be joined.\n// Then validate JSON structure before passing downstream.\n\nconst tripData = $('05 | Rate Aggregator').item.json;\nconst pollResponse = $input.first().json;\n\n// ── READ REPLICATE OUTPUT ──────────────────────────────────────────────────\n// Replicate streams output as array chunks e.g. [\"Day\", \" 1\", \": ...]\n// We join them into a single string before parsing.\nlet rawContent = '';\nif (Array.isArray(pollResponse.output)) {\n  rawContent = pollResponse.output.join('');\n} else if (typeof pollResponse.output === 'string') {\n  rawContent = pollResponse.output;\n} else {\n  throw new Error(`PARSE_ERROR: Replicate returned unexpected output type: ${typeof pollResponse.output}. Status: ${pollResponse.status}. Raw: ${JSON.stringify(pollResponse.output || '').substring(0, 200)}`);\n}\n\nif (!rawContent || rawContent.trim().length === 0) {\n  throw new Error(`PARSE_ERROR: Replicate returned empty output. Status: ${pollResponse.status}. Logs: ${String(pollResponse.logs || 'none').substring(0, 300)}`);\n}\n\n// ── STRIP MARKDOWN FENCES + PARSE JSON ────────────────────────────────────\nlet itinerary;\ntry {\n  const cleaned = rawContent.replace(/```json/gi, '').replace(/```/g, '').trim();\n  itinerary = JSON.parse(cleaned);\n} catch(e) {\n  throw new Error(`PARSE_ERROR: Replicate returned invalid JSON. Parse error: ${e.message}. Raw (first 300 chars): ${rawContent.substring(0, 300)}`);\n}\n\n// ── VALIDATE MINIMUM REQUIRED STRUCTURE ───────────────────────────────────\nif (!itinerary.itinerary || !Array.isArray(itinerary.itinerary)) {\n  throw new Error('STRUCTURE_ERROR: itinerary array missing from Replicate response.');\n}\n\nif (itinerary.itinerary.length === 0) {\n  throw new Error('STRUCTURE_ERROR: itinerary array is empty.');\n}\n\nreturn [{ json: { ...tripData, ai_itinerary: itinerary } }];\n"
+      },
+      "id": "ac197ec2-2a3d-40a0-98d6-4db736c2c29e",
+      "name": "08 | Itinerary Parser & Validator",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -2240,
+        64
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─── PRICING ENGINE ─────────────────────────────────────────────────────────\n// Production pricing calculation engine.\n// Implements: base cost aggregation, dynamic margin, seasonal multiplier,\n// currency formatting, and per-component breakdowns.\n\nconst data = $input.first().json;\nconst trip = data.trip;\nconst financial = data.financial;\nconst meta = data.meta;\nconst aiCost = data.ai_itinerary?.cost_summary || {};\nconst numTravelers = trip.num_travelers;\nconst numDays = trip.num_days;\n\n// ── STEP 1: Base cost from AI itinerary (with DB rate sanity-check) ──────────\nconst hotelTotal      = parseFloat(aiCost.hotel_total)      || (data.rates.hotel_per_night * numDays);\nconst transportTotal  = parseFloat(aiCost.transport_total)  || (data.rates.transport_per_day * numDays);\nconst activitiesTotal = parseFloat(aiCost.activities_total) || (data.rates.activity_per_day * numDays * numTravelers);\nconst mealsTotal      = parseFloat(aiCost.meals_total)      || (data.rates.meal_per_day * numDays * numTravelers);\nconst guideFees       = parseFloat(aiCost.guide_fees)       || (data.rates.guide_per_day * numDays);\nconst miscellaneous   = parseFloat(aiCost.miscellaneous)    || Math.round(hotelTotal * 0.05);\n\nconst rawBaseCost = hotelTotal + transportTotal + activitiesTotal + mealsTotal + guideFees + miscellaneous;\n\n// ── STEP 2: Seasonal multiplier ──────────────────────────────────────────────\nconst seasonalMultiplier = meta.seasonal_multiplier || 1.0;\nconst seasonalizedCost = rawBaseCost * seasonalMultiplier;\n\n// ── STEP 3: Dynamic margin ───────────────────────────────────────────────────\n// Margin scales inversely with budget tier (luxury gets lower margin)\nconst marginMap = { budget: 0.30, 'mid-range': 0.25, premium: 0.22, luxury: 0.18 };\nconst marginRate = marginMap[financial.budget_tier] || 0.25;\nconst marginAmount = seasonalizedCost * marginRate;\n\n// ── STEP 4: Taxes & fees ─────────────────────────────────────────────────────\nconst taxRate = 0.05; // 5% service tax\nconst taxAmount = (seasonalizedCost + marginAmount) * taxRate;\n\n// ── STEP 5: Final selling price ──────────────────────────────────────────────\nconst finalTotal = seasonalizedCost + marginAmount + taxAmount;\nconst finalPerPerson = finalTotal / numTravelers;\n\n// ── STEP 6: Budget validation flag ───────────────────────────────────────────\nconst overBudget = finalTotal > financial.budget_total;\nconst budgetVariance = Math.round(((finalTotal - financial.budget_total) / financial.budget_total) * 100);\n\n// ── STEP 7: Payment schedule ─────────────────────────────────────────────────\nconst depositPct = 0.30;\nconst depositAmount = finalTotal * depositPct;\nconst balanceAmount = finalTotal - depositAmount;\n\n// ── HELPER: USD formatter ─────────────────────────────────────────────────────\nconst fmt = n => '$' + parseFloat(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });\n\nconst quotationId = `QT-${Date.now()}`;\n\nreturn [{\n  json: {\n    ...data,\n    pricing: {\n      quotation_id: quotationId,\n      breakdown: {\n        hotel_total:       Math.round(hotelTotal),\n        transport_total:   Math.round(transportTotal),\n        activities_total:  Math.round(activitiesTotal),\n        meals_total:       Math.round(mealsTotal),\n        guide_fees:        Math.round(guideFees),\n        miscellaneous:     Math.round(miscellaneous),\n        raw_base_cost:     Math.round(rawBaseCost)\n      },\n      seasonal_multiplier:   seasonalMultiplier,\n      seasonalized_cost:     Math.round(seasonalizedCost),\n      margin_rate:           `${Math.round(marginRate * 100)}%`,\n      margin_amount:         Math.round(marginAmount),\n      tax_rate:              `${Math.round(taxRate * 100)}%`,\n      tax_amount:            Math.round(taxAmount),\n      final_total:           Math.round(finalTotal),\n      final_per_person:      Math.round(finalPerPerson),\n      // Formatted display values\n      display: {\n        final_total:       fmt(finalTotal),\n        final_per_person:  fmt(finalPerPerson),\n        deposit_amount:    fmt(depositAmount),\n        balance_amount:    fmt(balanceAmount),\n        hotel_total:       fmt(hotelTotal),\n        transport_total:   fmt(transportTotal),\n        activities_total:  fmt(activitiesTotal),\n        meals_total:       fmt(mealsTotal)\n      },\n      payment_schedule: {\n        deposit_pct:    `${Math.round(depositPct * 100)}%`,\n        deposit_amount: Math.round(depositAmount),\n        balance_amount: Math.round(balanceAmount),\n        deposit_due:    'Within 48 hours of confirmation',\n        balance_due:    `30 days before departure (${data.trip.start_date})`\n      },\n      flags: {\n        over_budget:      overBudget,\n        budget_variance:  `${budgetVariance > 0 ? '+' : ''}${budgetVariance}%`,\n        season:           meta.season,\n        rates_source:     data.rates_source\n      },\n      currency: 'USD',\n      generated_at: new Date().toISOString()\n    }\n  }\n}];\n"
+      },
+      "id": "def5878c-3555-42e9-a8ba-37d0bd0cdec2",
+      "name": "09 | Pricing Engine",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -2000,
+        64
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  id,\n  vendor_name,\n  vendor_email,\n  vendor_category,\n  phone,\n  sla_hours,\n  preferred_contact_method\nFROM vendors\nWHERE is_active = true\n  AND (service_destinations @> ARRAY['{{ $('02 | Input Normalizer & Validator').item.json.trip.destination }}']::text[]\n    OR service_destinations IS NULL)\nORDER BY vendor_category, rating DESC\nLIMIT 10;",
+        "options": {}
+      },
+      "id": "822811ac-100e-4c0f-bd50-20765fbb24cc",
+      "name": "10 | Fetch Active Vendors",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        -1760,
+        64
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "c5UZ7YQKkPSsyEnL",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─── VENDOR RFQ EMAIL BUILDER ────────────────────────────────────────────────\n// Builds one RFQ payload per vendor with personalized content.\n\nconst vendors = $input.all().map(i => i.json);\nconst pricingData = $('09 | Pricing Engine').item.json;\nconst trip = pricingData.trip;\nconst client = pricingData.client;\nconst pricing = pricingData.pricing;\n\nif (vendors.length === 0) {\n  // No vendors in DB — create internal alert\n  return [{\n    json: {\n      skip_rfq: true,\n      reason: 'No active vendors found for destination',\n      destination: trip.destination\n    }\n  }];\n}\n\nreturn vendors.map(vendor => ({\n  json: {\n    vendor_id: vendor.id,\n    vendor_name: vendor.vendor_name,\n    vendor_email: vendor.vendor_email,\n    vendor_category: vendor.vendor_category,\n    sla_hours: vendor.sla_hours || 24,\n    rfq_subject: `[RFQ] ${vendor.vendor_category} Services — ${trip.destination} | ${trip.travel_dates}`,\n    rfq_body: `Dear ${vendor.vendor_name},\\n\\nWe are requesting a formal quotation for the following booking:\\n\\nDESTINATION: ${trip.destination}\\nTRIP TYPE: ${trip.trip_type}\\nTRAVEL DATES: ${trip.travel_dates} (${trip.num_days} days)\\nTRAVELERS: ${trip.num_travelers} pax\\nSERVICE REQUIRED: ${vendor.vendor_category}\\nBUDGET TIER: ${pricingData.financial.budget_tier}\\n\\nPlease confirm availability and provide your best rates for the above.\\n\\nSLA: Please respond within ${vendor.sla_hours || 24} hours.\\nReference ID: ${pricing.quotation_id}\\n\\nRegards,\\nTour Passion Operations Team`,\n    meta: {\n      quotation_id: pricing.quotation_id,\n      request_id: pricingData.requestId,\n      sent_at: new Date().toISOString(),\n      followup_due: new Date(Date.now() + (vendor.sla_hours || 24) * 60 * 60 * 1000).toISOString()\n    }\n  }\n}));\n"
+      },
+      "id": "0823599f-850e-4672-a0c3-ada65daf0e22",
+      "name": "11 | RFQ Email Builder",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1520,
+        64
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "leftValue": "={{ $json.skip_rfq }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "9beaba91-a973-4409-a484-fd56b532d567",
+      "name": "12 | Skip RFQ Check",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        -1280,
+        64
+      ]
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $json.vendor_email }}",
+        "subject": "={{ $json.rfq_subject }}",
+        "emailType": "text",
+        "message": "={{ $json.rfq_body }}",
+        "options": {
+          "appendAttribution": false,
+          "replyTo": "operations@tourpassion.com"
+        }
+      },
+      "id": "09e9eabc-ed8d-4f72-88b1-9ba3865230cd",
+      "name": "13 | Send RFQ Emails",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2,
+      "position": [
+        -1040,
+        -16
+      ],
+      "webhookId": "87c9bf90-8898-4b7e-8edc-2c5697b692e8",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "9YijJ7iuYtH56N2d",
+          "name": "Gmail account"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "amount": 24
+      },
+      "id": "f628d531-27e4-4a43-816a-2e3d7cc8a047",
+      "name": "14 | Wait 24h (Vendor SLA)",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1,
+      "position": [
+        -800,
+        -16
+      ],
+      "webhookId": "3ff208c7-38ac-4eb7-9cc2-b34da477f7a3"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT rfq_response_received FROM vendor_rfq_log\nWHERE quotation_id = '{{ $('09 | Pricing Engine').item.json.pricing.quotation_id }}'\n  AND vendor_email = '{{ $json.vendor_email }}'\nLIMIT 1;",
+        "options": {}
+      },
+      "id": "8fb8ce71-7268-4513-b663-ee86f040f777",
+      "name": "15 | Check RFQ Response in DB",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        -560,
+        -16
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "c5UZ7YQKkPSsyEnL",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "leftValue": "={{ $json.rfq_response_received }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "notEquals"
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "aad19ace-4492-40a0-8850-730cf478959f",
+      "name": "16 | Vendor Responded?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        -320,
+        -16
+      ]
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $('11 | RFQ Email Builder').item.json.vendor_email }}",
+        "subject": "=[FOLLOW-UP] {{ $('11 | RFQ Email Builder').item.json.rfq_subject }}",
+        "emailType": "text",
+        "message": "=Dear {{ $('11 | RFQ Email Builder').item.json.vendor_name }},\n\nThis is a follow-up on our RFQ sent 24 hours ago.\nReference ID: {{ $('09 | Pricing Engine').item.json.pricing.quotation_id }}\n\nWe require your response urgently to proceed with client booking.\nPlease respond within 4 hours or we may need to engage alternate vendors.\n\nRegards,\nTour Passion Operations",
+        "options": {
+          "replyTo": "operations@tourpassion.com"
+        }
+      },
+      "id": "31b61c5b-2fa9-4738-b426-b487e1c676be",
+      "name": "17 | Send RFQ Follow-up",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2,
+      "position": [
+        -80,
+        -96
+      ],
+      "webhookId": "1a391072-5cf4-45d5-8a89-9dfcd93e6696",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "9YijJ7iuYtH56N2d",
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─── HTML ITINERARY BUILDER ──────────────────────────────────────────────────\n// Produces a full branded HTML document for PDF conversion.\n\nconst d = $('09 | Pricing Engine').item.json;\nconst itin = d.ai_itinerary;\nconst pricing = d.pricing;\nconst client = d.client;\nconst trip = d.trip;\n\nconst daysHtml = (itin.itinerary || []).map(day => {\n  const acts = (day.activities || []).map(a =>\n    `<div class=\"activity\">\n      <span class=\"act-time\">${a.time}</span>\n      <span class=\"act-name\">${a.name}</span>\n      <span class=\"act-desc\">${a.description}</span>\n      <span class=\"act-cost\">$${a.cost_per_person}/person</span>\n    </div>`\n  ).join('');\n\n  return `\n  <div class=\"day-card\">\n    <div class=\"day-header\">\n      <div class=\"day-num\">Day ${day.day}</div>\n      <div class=\"day-title\">${day.title}</div>\n      <div class=\"day-date\">${day.date}</div>\n    </div>\n    <div class=\"day-body\">\n      <div class=\"info-row\"><span class=\"label\">🏨 Hotel</span><span>${day.hotel?.name} (${day.hotel?.category}) — $${day.hotel?.rate_per_night}/night</span></div>\n      <div class=\"info-row\"><span class=\"label\">🚌 Transport</span><span>${day.transport?.mode} — ${day.transport?.description}</span></div>\n      <div class=\"info-row\"><span class=\"label\">🍽 Meals</span><span>${day.meals?.breakfast} / ${day.meals?.lunch} / ${day.meals?.dinner}</span></div>\n      <div class=\"activities-section\"><div class=\"section-sub\">Activities</div>${acts}</div>\n      ${day.notes ? `<div class=\"day-note\">💡 ${day.notes}</div>` : ''}\n    </div>\n    <div class=\"day-total\">Day Total (per person): $${day.day_total_per_person}</div>\n  </div>`;\n}).join('');\n\nconst html = `<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n<title>Travel Proposal — ${trip.destination}</title>\n<style>\n  * { box-sizing:border-box; margin:0; padding:0; }\n  body { font-family:'Segoe UI',Arial,sans-serif; background:#f5f5f5; color:#222; }\n  .cover { background:linear-gradient(135deg,#0a2342,#1a5276); color:#fff; padding:60px 48px; }\n  .cover h1 { font-size:42px; font-weight:900; letter-spacing:-1px; margin-bottom:8px; }\n  .cover .sub { font-size:16px; opacity:0.75; margin-bottom:32px; }\n  .cover .meta { font-size:14px; opacity:0.8; line-height:2; }\n  .section { padding:40px 48px; background:#fff; margin-bottom:16px; border-radius:4px; }\n  .section h2 { font-size:22px; color:#0a2342; border-bottom:3px solid #1a5276; padding-bottom:10px; margin-bottom:24px; }\n  .pricing-grid { display:grid; grid-template-columns:1fr 1fr; gap:16px; }\n  .price-card { background:#f0f4fa; padding:20px; border-radius:8px; border-left:4px solid #1a5276; }\n  .price-card .label { font-size:11px; color:#666; letter-spacing:1px; text-transform:uppercase; margin-bottom:4px; }\n  .price-card .value { font-size:22px; font-weight:700; color:#0a2342; }\n  .highlight { background:linear-gradient(135deg,#0a2342,#1a5276); color:#fff; padding:24px; border-radius:8px; text-align:center; }\n  .highlight .label { font-size:13px; opacity:0.75; }\n  .highlight .value { font-size:38px; font-weight:900; }\n  .day-card { border:1px solid #e0e0e0; border-radius:8px; margin-bottom:20px; overflow:hidden; }\n  .day-header { background:#0a2342; color:#fff; padding:16px 20px; display:flex; justify-content:space-between; align-items:center; }\n  .day-num { background:#1a5276; padding:4px 10px; border-radius:4px; font-size:13px; }\n  .day-title { font-size:16px; font-weight:600; }\n  .day-date { font-size:13px; opacity:0.8; }\n  .day-body { padding:20px; }\n  .info-row { display:flex; gap:16px; padding:6px 0; border-bottom:1px solid #f0f0f0; font-size:14px; }\n  .info-row .label { color:#1a5276; font-weight:600; min-width:100px; }\n  .activities-section { margin-top:16px; }\n  .section-sub { font-size:12px; letter-spacing:1px; text-transform:uppercase; color:#666; margin-bottom:8px; }\n  .activity { background:#f8faff; padding:10px 14px; margin-bottom:8px; border-radius:6px; display:grid; grid-template-columns:80px 140px 1fr 80px; gap:10px; font-size:13px; align-items:center; }\n  .act-time { color:#1a5276; font-weight:600; }\n  .act-name { font-weight:600; }\n  .act-desc { color:#555; }\n  .act-cost { text-align:right; color:#0a7c4e; font-weight:600; }\n  .day-total { background:#f0f4fa; padding:12px 20px; font-weight:700; color:#0a2342; text-align:right; font-size:14px; }\n  .day-note { margin-top:12px; padding:10px; background:#fffde7; border-radius:4px; font-size:13px; color:#555; }\n  .tips-list { list-style:disc; padding-left:20px; line-height:2.2; font-size:14px; color:#444; }\n  .footer { text-align:center; padding:32px; background:#0a2342; color:rgba(255,255,255,0.6); font-size:12px; }\n  .payment-row { display:flex; justify-content:space-between; padding:12px 0; border-bottom:1px solid #eee; font-size:14px; }\n  .payment-row.total { font-weight:700; font-size:16px; border-bottom:none; padding-top:16px; }\n  .flag-badge { display:inline-block; padding:4px 10px; border-radius:20px; font-size:12px; font-weight:600; }\n  .flag-ok { background:#d4edda; color:#155724; }\n  .flag-warn { background:#fff3cd; color:#856404; }\n</style>\n</head>\n<body>\n\n<div class=\"cover\">\n  <div style=\"font-size:12px;letter-spacing:3px;opacity:0.5;margin-bottom:16px;\">TOUR PASSION — TRAVEL PROPOSAL</div>\n  <h1>✈ ${trip.destination}</h1>\n  <div class=\"sub\">${trip.trip_type} Trip · ${trip.num_days} Days · ${trip.num_travelers} Traveler(s)</div>\n  <div class=\"meta\">\n    <div>📅 Dates: ${trip.travel_dates}</div>\n    <div>🌍 Season: ${d.meta.season.toUpperCase()}</div>\n    <div>💎 Tier: ${d.financial.budget_tier.toUpperCase()}</div>\n    <div>📋 Ref: ${pricing.quotation_id}</div>\n    <div>👤 Prepared for: ${client.name}</div>\n  </div>\n</div>\n\n<div class=\"section\">\n  <h2>💰 Investment Summary</h2>\n  <div class=\"pricing-grid\">\n    <div class=\"price-card\"><div class=\"label\">Hotel (${trip.num_days} nights)</div><div class=\"value\">${pricing.display.hotel_total}</div></div>\n    <div class=\"price-card\"><div class=\"label\">Transport</div><div class=\"value\">${pricing.display.transport_total}</div></div>\n    <div class=\"price-card\"><div class=\"label\">Activities</div><div class=\"value\">${pricing.display.activities_total}</div></div>\n    <div class=\"price-card\"><div class=\"label\">Meals</div><div class=\"value\">${pricing.display.meals_total}</div></div>\n  </div>\n  <div style=\"margin-top:20px;padding:16px 0;border-top:1px solid #eee;\">\n    <div class=\"payment-row\"><span>Base Cost</span><span>$${pricing.breakdown.raw_base_cost}</span></div>\n    <div class=\"payment-row\"><span>Seasonal Multiplier (${d.meta.season})</span><span>×${pricing.seasonal_multiplier}</span></div>\n    <div class=\"payment-row\"><span>Service Charge (${pricing.margin_rate})</span><span>$${pricing.margin_amount}</span></div>\n    <div class=\"payment-row\"><span>Taxes & Fees (${pricing.tax_rate})</span><span>$${pricing.tax_amount}</span></div>\n    <div class=\"payment-row total\"><span>TOTAL INVESTMENT</span><span>${pricing.display.final_total}</span></div>\n    <div class=\"payment-row\"><span style=\"color:#666;\">Per Person</span><span style=\"color:#1a5276;font-weight:600;\">${pricing.display.final_per_person}</span></div>\n  </div>\n  <div class=\"highlight\" style=\"margin-top:20px;\">\n    <div class=\"label\">TOTAL PACKAGE PRICE</div>\n    <div class=\"value\">${pricing.display.final_total} USD</div>\n    <div style=\"margin-top:8px;font-size:13px;opacity:0.8;\">${pricing.display.final_per_person} per person</div>\n  </div>\n  <div style=\"margin-top:16px;\">\n    <div class=\"payment-row\"><span>📥 Deposit (${pricing.payment_schedule.deposit_pct})</span><span style=\"color:#c0392b;font-weight:600;\">${pricing.display.deposit_amount}</span></div>\n    <div class=\"payment-row\"><span>Balance Due</span><span>${pricing.display.balance_amount}</span></div>\n    <div style=\"font-size:12px;color:#666;margin-top:8px;\">${pricing.payment_schedule.balance_due}</div>\n  </div>\n</div>\n\n<div class=\"section\">\n  <h2>🗓 Day-by-Day Itinerary</h2>\n  ${daysHtml}\n</div>\n\n${itin.highlights?.length ? `<div class=\"section\"><h2>⭐ Trip Highlights</h2><ul class=\"tips-list\">${itin.highlights.map(h=>`<li>${h}</li>`).join('')}</ul></div>` : ''}\n\n${itin.travel_tips?.length ? `<div class=\"section\"><h2>💡 Travel Tips</h2><ul class=\"tips-list\">${itin.travel_tips.map(t=>`<li>${t}</li>`).join('')}</ul></div>` : ''}\n\n${itin.visa_notes ? `<div class=\"section\"><h2>📝 Visa & Entry Notes</h2><p style=\"font-size:14px;color:#444;line-height:1.8;\">${itin.visa_notes}</p></div>` : ''}\n\n<div class=\"footer\">\n  <div style=\"margin-bottom:8px;\">Tour Passion Travel Agency · operations@tourpassion.com</div>\n  <div>Proposal generated on ${new Date().toLocaleDateString('en-US',{year:'numeric',month:'long',day:'numeric'})} · Valid for 7 days</div>\n  <div style=\"margin-top:6px;\">Reference: ${pricing.quotation_id}</div>\n</div>\n\n</body></html>`;\n\nreturn [{ json: { ...$('09 | Pricing Engine').item.json, html_document: html } }];\n"
+      },
+      "id": "5bbee0bc-279b-4c41-bfc5-0f13a1232216",
+      "name": "18 | HTML Proposal Builder",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -2000,
+        336
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.pdfshift.io/v3/convert/pdf",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Basic {{ Buffer.from('api:' + $env.PDFSHIFT_API_KEY).toString('base64') }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ source: $json.html_document, landscape: false, format: 'A4', margin: '12mm', use_print: false }) }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "file",
+              "outputPropertyName": "proposal_pdf"
+            }
+          },
+          "timeout": 30000
+        }
+      },
+      "id": "84ad681b-12d7-451f-b748-6ab13e538e40",
+      "name": "19 | PDF Generator",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        -1760,
+        336
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "q9QFPFIBqj4jGkmL",
+          "name": "pdfshift"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $('02 | Input Normalizer & Validator').item.json.client.email }}",
+        "subject": "=✈ Your {{ $('09 | Pricing Engine').item.json.trip.trip_type }} Trip to {{ $('09 | Pricing Engine').item.json.trip.destination }} — Proposal & Quotation",
+        "message": "=<!DOCTYPE html><html><body style=\"font-family:'Segoe UI',Arial,sans-serif;max-width:640px;margin:0 auto;background:#f5f5f5;padding:20px;\">\n<div style=\"background:linear-gradient(135deg,#0a2342,#1a5276);color:white;padding:40px;border-radius:12px 12px 0 0;\">\n  <div style=\"font-size:11px;letter-spacing:3px;opacity:0.6;\">TOUR PASSION</div>\n  <h1 style=\"font-size:30px;margin:12px 0 4px;\">Your Trip is Ready!</h1>\n  <p style=\"opacity:0.8;font-size:15px;\">✈ {{ $('09 | Pricing Engine').item.json.trip.destination }} · {{ $('09 | Pricing Engine').item.json.trip.num_days }} Days</p>\n</div>\n<div style=\"background:white;padding:32px;border-radius:0 0 12px 12px;\">\n  <p style=\"font-size:16px;color:#333;\">Dear {{ $('02 | Input Normalizer & Validator').item.json.client.name }},</p>\n  <p style=\"color:#555;line-height:1.8;margin:16px 0;\">We're excited to share your personalized <strong>{{ $('09 | Pricing Engine').item.json.trip.trip_type }}</strong> itinerary for <strong>{{ $('09 | Pricing Engine').item.json.trip.destination }}</strong>. Please find your detailed proposal attached as a PDF.</p>\n\n  <div style=\"background:#f0f4fa;border-radius:10px;padding:24px;margin:24px 0;border-left:4px solid #1a5276;\">\n    <div style=\"font-size:11px;color:#888;letter-spacing:2px;margin-bottom:4px;\">YOUR INVESTMENT</div>\n    <div style=\"font-size:36px;font-weight:900;color:#0a2342;\">{{ $('09 | Pricing Engine').item.json.pricing.display.final_total }}</div>\n    <div style=\"font-size:13px;color:#666;margin-top:4px;\">{{ $('09 | Pricing Engine').item.json.pricing.display.final_per_person }} per person · {{ $('09 | Pricing Engine').item.json.trip.num_travelers }} traveler(s) · {{ $('09 | Pricing Engine').item.json.trip.num_days }} days</div>\n  </div>\n\n  <table style=\"width:100%;border-collapse:collapse;font-size:14px;\">\n    <tr style=\"border-bottom:1px solid #eee;\"><td style=\"padding:10px 0;color:#555;\">🗓 Travel Dates</td><td style=\"text-align:right;font-weight:600;\">{{ $('09 | Pricing Engine').item.json.trip.travel_dates }}</td></tr>\n    <tr style=\"border-bottom:1px solid #eee;\"><td style=\"padding:10px 0;color:#555;\">👥 Travelers</td><td style=\"text-align:right;font-weight:600;\">{{ $('09 | Pricing Engine').item.json.trip.num_travelers }}</td></tr>\n    <tr style=\"border-bottom:1px solid #eee;\"><td style=\"padding:10px 0;color:#555;\">🏷 Season</td><td style=\"text-align:right;font-weight:600;\">{{ $('09 | Pricing Engine').item.json.meta.season }}</td></tr>\n    <tr><td style=\"padding:10px 0;color:#555;\">📋 Reference</td><td style=\"text-align:right;font-weight:600;\">{{ $('09 | Pricing Engine').item.json.pricing.quotation_id }}</td></tr>\n  </table>\n\n  <div style=\"background:#fff3cd;border-radius:8px;padding:16px;margin:24px 0;\">\n    <div style=\"font-weight:700;color:#856404;margin-bottom:6px;\">📥 To Confirm Your Booking</div>\n    <div style=\"font-size:13px;color:#856404;\">A deposit of <strong>{{ $('09 | Pricing Engine').item.json.pricing.display.deposit_amount }}</strong> ({{ $('09 | Pricing Engine').item.json.pricing.payment_schedule.deposit_pct }}) secures your trip. This proposal is valid for 7 days.</div>\n  </div>\n\n  <div style=\"text-align:center;margin:28px 0;\">\n    <a href=\"mailto:bookings@tourpassion.com?subject=CONFIRM: {{ $('09 | Pricing Engine').item.json.pricing.quotation_id }}\" style=\"background:linear-gradient(135deg,#0a2342,#1a5276);color:white;padding:16px 36px;border-radius:8px;text-decoration:none;font-weight:700;font-size:15px;display:inline-block;\">✅ Confirm My Booking</a>\n  </div>\n\n  <p style=\"font-size:13px;color:#888;text-align:center;\">Questions? Reply to this email or call our team.<br>Tour Passion · operations@tourpassion.com</p>\n</div>\n</body></html>",
+        "options": {
+          "appendAttribution": false,
+          "attachmentsUi": {
+            "attachmentsBinary": [
+              {
+                "property": "proposal_pdf"
+              }
+            ]
+          },
+          "replyTo": "bookings@tourpassion.com"
+        }
+      },
+      "id": "faddb9d3-33e1-44d5-b85a-f5c44133ce27",
+      "name": "20 | Client Proposal Email",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2,
+      "position": [
+        -1520,
+        336
+      ],
+      "webhookId": "47e6a501-d128-4633-b57d-9d9c52849cee",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "9YijJ7iuYtH56N2d",
+          "name": "Gmail account"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO quotes (\n  quotation_id, client_id, destination, trip_type,\n  travel_dates, start_date, end_date, num_days,\n  num_travelers, budget_total, budget_tier,\n  base_cost, seasonal_multiplier, margin_rate, margin_amount,\n  tax_amount, final_total, final_per_person,\n  deposit_amount, balance_amount,\n  season, rates_source, ai_itinerary_json,\n  status, created_at, valid_until\n) VALUES (\n  '{{ $('09 | Pricing Engine').item.json.pricing.quotation_id }}',\n  (SELECT id FROM clients WHERE email = '{{ $('02 | Input Normalizer & Validator').item.json.client.email }}' LIMIT 1),\n  '{{ $('09 | Pricing Engine').item.json.trip.destination }}',\n  '{{ $('09 | Pricing Engine').item.json.trip.trip_type }}',\n  '{{ $('09 | Pricing Engine').item.json.trip.travel_dates }}',\n  '{{ $('09 | Pricing Engine').item.json.trip.start_date }}',\n  '{{ $('09 | Pricing Engine').item.json.trip.end_date }}',\n  {{ $('09 | Pricing Engine').item.json.trip.num_days }},\n  {{ $('09 | Pricing Engine').item.json.trip.num_travelers }},\n  {{ $('09 | Pricing Engine').item.json.financial.budget_total }},\n  '{{ $('09 | Pricing Engine').item.json.financial.budget_tier }}',\n  {{ $('09 | Pricing Engine').item.json.pricing.breakdown.raw_base_cost }},\n  {{ $('09 | Pricing Engine').item.json.pricing.seasonal_multiplier }},\n  '{{ $('09 | Pricing Engine').item.json.pricing.margin_rate }}',\n  {{ $('09 | Pricing Engine').item.json.pricing.margin_amount }},\n  {{ $('09 | Pricing Engine').item.json.pricing.tax_amount }},\n  {{ $('09 | Pricing Engine').item.json.pricing.final_total }},\n  {{ $('09 | Pricing Engine').item.json.pricing.final_per_person }},\n  {{ $('09 | Pricing Engine').item.json.pricing.payment_schedule.deposit_amount }},\n  {{ $('09 | Pricing Engine').item.json.pricing.payment_schedule.balance_amount }},\n  '{{ $('09 | Pricing Engine').item.json.meta.season }}',\n  '{{ $('09 | Pricing Engine').item.json.rates_source }}',\n  '{{ JSON.stringify($('09 | Pricing Engine').item.json.ai_itinerary) }}'::jsonb,\n  'proposal_sent',\n  NOW(),\n  NOW() + INTERVAL '7 days'\n)\nRETURNING id, quotation_id, status, created_at;",
+        "options": {}
+      },
+      "id": "4ea047a4-4714-4eb8-a468-7193864ba7a3",
+      "name": "21 | Insert Quote to DB",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        -1280,
+        336
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "c5UZ7YQKkPSsyEnL",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO bookings (\n  quotation_id, client_id, destination, trip_type,\n  travel_dates, num_travelers, status,\n  final_amount, deposit_amount, balance_amount,\n  margin_rate, season, created_at, updated_at\n) VALUES (\n  '{{ $('09 | Pricing Engine').item.json.pricing.quotation_id }}',\n  (SELECT id FROM clients WHERE email = '{{ $('02 | Input Normalizer & Validator').item.json.client.email }}' LIMIT 1),\n  '{{ $('09 | Pricing Engine').item.json.trip.destination }}',\n  '{{ $('09 | Pricing Engine').item.json.trip.trip_type }}',\n  '{{ $('09 | Pricing Engine').item.json.trip.travel_dates }}',\n  {{ $('09 | Pricing Engine').item.json.trip.num_travelers }},\n  'proposal_sent',\n  {{ $('09 | Pricing Engine').item.json.pricing.final_total }},\n  {{ $('09 | Pricing Engine').item.json.pricing.payment_schedule.deposit_amount }},\n  {{ $('09 | Pricing Engine').item.json.pricing.payment_schedule.balance_amount }},\n  '{{ $('09 | Pricing Engine').item.json.pricing.margin_rate }}',\n  '{{ $('09 | Pricing Engine').item.json.meta.season }}',\n  NOW(),\n  NOW()\n)\nRETURNING id, quotation_id, status;",
+        "options": {}
+      },
+      "id": "f7143ec2-b2c6-45b9-a883-76f70cea7014",
+      "name": "22 | Initialize Booking Record",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        -1040,
+        336
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "c5UZ7YQKkPSsyEnL",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO audit_logs (\n  request_id, quotation_id, client_email, event_type,\n  event_status, destination, final_amount,\n  processing_time_ms, rates_source, season,\n  error_message, created_at\n) VALUES (\n  '{{ $('02 | Input Normalizer & Validator').item.json.requestId }}',\n  '{{ $('09 | Pricing Engine').item.json.pricing.quotation_id }}',\n  '{{ $('02 | Input Normalizer & Validator').item.json.client.email }}',\n  'itinerary_generated',\n  'success',\n  '{{ $('09 | Pricing Engine').item.json.trip.destination }}',\n  {{ $('09 | Pricing Engine').item.json.pricing.final_total }},\n  {{ Date.now() - new Date($('02 | Input Normalizer & Validator').item.json.meta.received_at).getTime() }},\n  '{{ $('09 | Pricing Engine').item.json.rates_source }}',\n  '{{ $('09 | Pricing Engine').item.json.meta.season }}',\n  NULL,\n  NOW()\n);",
+        "options": {}
+      },
+      "id": "ed375923-bc49-473e-8ae3-8a22cbae2520",
+      "name": "23 | Audit Log — Success",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        -800,
+        336
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "c5UZ7YQKkPSsyEnL",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\n  \"success\": true,\n  \"request_id\": \"{{ $('02 | Input Normalizer & Validator').item.json.requestId }}\",\n  \"quotation_id\": \"{{ $('09 | Pricing Engine').item.json.pricing.quotation_id }}\",\n  \"client_email\": \"{{ $('02 | Input Normalizer & Validator').item.json.client.email }}\",\n  \"destination\": \"{{ $('09 | Pricing Engine').item.json.trip.destination }}\",\n  \"final_quotation\": \"{{ $('09 | Pricing Engine').item.json.pricing.display.final_total }}\",\n  \"per_person\": \"{{ $('09 | Pricing Engine').item.json.pricing.display.final_per_person }}\",\n  \"status\": \"proposal_sent\",\n  \"message\": \"Itinerary generated and proposal emailed to client successfully.\"\n}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "9620c290-1097-4aa2-8965-55cb2ab07f9d",
+      "name": "24 | Webhook Response — Success",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        -560,
+        336
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─── GLOBAL ERROR HANDLER ──────────────────────────────────────────────────\n// Catches errors from any node in the workflow.\n// Structures error payload for alerting and DB logging.\n\nconst errItem = $input.first();\nconst errMsg = String(errItem.json.error?.message || errItem.json.message || errItem.json.error || 'Unknown error');\nconst errNode = errItem.json.error?.node || 'Unknown node';\n\nlet requestId = 'UNKNOWN';\nlet clientEmail = 'UNKNOWN';\nlet destination = 'UNKNOWN';\n\ntry { requestId = $('02 | Input Normalizer & Validator').item.json.requestId; } catch(e) {}\ntry { clientEmail = $('02 | Input Normalizer & Validator').item.json.client.email; } catch(e) {}\ntry { destination = $('02 | Input Normalizer & Validator').item.json.trip.destination; } catch(e) {}\n\n// Updated: REPLICATE replaces OPENAI in retryable detection\nconst isRetryable = (\n  errMsg.includes('REPLICATE') ||\n  errMsg.includes('rate limit') ||\n  errMsg.includes('timeout') ||\n  errMsg.includes('503') ||\n  errMsg.includes('502') ||\n  errMsg.includes('429')\n);\n\nreturn [{\n  json: {\n    error: {\n      message: errMsg,\n      node: errNode,\n      type: errMsg.startsWith('VALIDATION') ? 'validation' :\n            errMsg.startsWith('PARSE')      ? 'parse' :\n            errMsg.startsWith('STRUCTURE')  ? 'structure' : 'system',\n      retryable: isRetryable,\n      timestamp: new Date().toISOString()\n    },\n    context: { requestId, clientEmail, destination },\n    alert: {\n      subject: `[ALERT] Travel Automation Error — ${destination}`,\n      body: `ERROR in Tour Passion Automation\\n\\nRequest ID: ${requestId}\\nClient: ${clientEmail}\\nDestination: ${destination}\\nNode: ${errNode}\\nError: ${errMsg}\\nRetryable: ${isRetryable}\\nTime: ${new Date().toISOString()}\\n\\nPlease investigate immediately.`\n    }\n  }\n}];\n"
+      },
+      "id": "fd5d6a16-5cf0-4513-8a6f-b08ba7cde8e7",
+      "name": "25 | Error Handler",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -2480,
+        368
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO audit_logs (\n  request_id, quotation_id, client_email, event_type,\n  event_status, destination, error_message, created_at\n) VALUES (\n  '{{ $json.context.requestId }}',\n  NULL,\n  '{{ $json.context.clientEmail }}',\n  'automation_error',\n  'failed',\n  '{{ $json.context.destination }}',\n  '{{ $json.error.message.replace(/'/g, \"''\") }}',\n  NOW()\n);",
+        "options": {}
+      },
+      "id": "56069d21-a3e8-4ed0-b5bd-a049039a0470",
+      "name": "26 | Log Error to DB",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        -2256,
+        368
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "c5UZ7YQKkPSsyEnL",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "sendTo": "admin@tourpassion.com",
+        "subject": "={{ $('25 | Error Handler').item.json.alert.subject }}",
+        "emailType": "text",
+        "message": "={{ $('25 | Error Handler').item.json.alert.body }}",
+        "options": {}
+      },
+      "id": "90d65b66-4818-48fe-bfca-8171e7f4c336",
+      "name": "27 | Admin Alert Email",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2,
+      "position": [
+        -2016,
+        656
+      ],
+      "webhookId": "5e17f6c0-1746-4ec0-9c41-d116ab6755b3",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "9YijJ7iuYtH56N2d",
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\n  \"success\": false,\n  \"request_id\": \"{{ $('25 | Error Handler').item.json.context.requestId }}\",\n  \"error\": \"{{ $('25 | Error Handler').item.json.error.type }}\",\n  \"message\": \"{{ $('25 | Error Handler').item.json.error.message }}\",\n  \"retryable\": {{ $('25 | Error Handler').item.json.error.retryable }}\n}",
+        "options": {
+          "responseCode": 500
+        }
+      },
+      "id": "04d513fa-2293-4855-a4af-1ccd01b5064e",
+      "name": "28 | Webhook Response — Error",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        -1808,
+        672
+      ]
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        -3472,
+        176
+      ],
+      "id": "6cde7a24-11f3-4a75-aea1-b5b1136f846f",
+      "name": "Wait",
+      "webhookId": "ca29f285-9d58-4e56-95dc-6493465239ef"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "e5cf84b5-87fd-48f4-a42d-5772ed27934f",
+              "leftValue": "={{ $json.status }}",
+              "rightValue": "succeeded",
+              "operator": {
+                "type": "string",
+                "operation": "equals",
+                "name": "filter.operator.equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -3120,
+        176
+      ],
+      "id": "e1f20831-069c-4695-927a-d0928bdb2916",
+      "name": "If"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.replicate.com/v1/models/openai/gpt-4.1-mini/predictions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\"input\": {\"system_prompt\": \"You are an expert travel itinerary planner. Generate a detailed, day-by-day itinerary as a valid JSON object ONLY — no markdown, no explanation, no code fences. The JSON must have this exact structure: { \\\"trip_title\\\": string, \\\"destination\\\": string, \\\"summary\\\": string, \\\"itinerary\\\": [ { \\\"day\\\": number, \\\"date\\\": string, \\\"title\\\": string, \\\"activities\\\": [ { \\\"time\\\": string, \\\"activity\\\": string, \\\"location\\\": string, \\\"cost_estimate\\\": number } ], \\\"meals\\\": { \\\"breakfast\\\": string, \\\"lunch\\\": string, \\\"dinner\\\": string }, \\\"accommodation\\\": { \\\"name\\\": string, \\\"type\\\": string, \\\"cost_per_night\\\": number }, \\\"transport\\\": string, \\\"daily_budget_estimate\\\": number } ], \\\"cost_summary\\\": { \\\"hotel_total\\\": number, \\\"transport_total\\\": number, \\\"activities_total\\\": number, \\\"meals_total\\\": number, \\\"guide_fees\\\": number, \\\"miscellaneous\\\": number, \\\"grand_total_estimate\\\": number }, \\\"travel_tips\\\": [ string ] }\", \"prompt\": \"=Generate a complete {{ $('05 | Rate Aggregator').item.json.trip.num_days }}-day travel itinerary for the following trip:\\n\\nCLIENT: {{ $('05 | Rate Aggregator').item.json.client.name }}\\nDESTINATION: {{ $('05 | Rate Aggregator').item.json.trip.destination }}\\nTRIP TYPE: {{ $('05 | Rate Aggregator').item.json.trip.trip_type }}\\nTRAVEL DATES: {{ $('05 | Rate Aggregator').item.json.trip.travel_dates }}\\nNUMBER OF DAYS: {{ $('05 | Rate Aggregator').item.json.trip.num_days }}\\nTRAVELERS: {{ $('05 | Rate Aggregator').item.json.trip.num_travelers }} person(s)\\nBUDGET TOTAL: ${{ $('05 | Rate Aggregator').item.json.financial.budget_total }}\\nBUDGET TIER: {{ $('05 | Rate Aggregator').item.json.financial.budget_tier }}\\nBUDGET PER PERSON/DAY: ${{ $('05 | Rate Aggregator').item.json.financial.budget_per_person_per_day }}\\nSEASON: {{ $('05 | Rate Aggregator').item.json.meta.season }}\\nHOTEL RATE/NIGHT: ${{ $('05 | Rate Aggregator').item.json.rates.hotel_per_night }}\\nTRANSPORT/DAY: ${{ $('05 | Rate Aggregator').item.json.rates.transport_per_day }}\\nACTIVITIES/DAY: ${{ $('05 | Rate Aggregator').item.json.rates.activity_per_day }}\\nMEALS/DAY: ${{ $('05 | Rate Aggregator').item.json.rates.meal_per_day }}\\nCLIENT PREFERENCES: {{ $('05 | Rate Aggregator').item.json.client.preferences }}\\n\\nReturn ONLY the JSON object. No markdown. No explanation.\", \"max_tokens\": 4096, \"temperature\": 0.7}}",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        -3664,
+        176
+      ],
+      "id": "3a1ed483-88ec-40d2-818f-9f8565acc063",
+      "name": "06 | Replicate Itinerary Generator",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "b7pOxznq9OXqDwhS",
+          "name": "Replicate API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "url": "={{ $('06 | Replicate Itinerary Generator').item.json.urls.get }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        -3296,
+        176
+      ],
+      "id": "445db897-6f14-45da-86be-d6f03d734469",
+      "name": "Poll",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "b7pOxznq9OXqDwhS",
+          "name": "Replicate API"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "01 | Webhook Trigger": {
+      "main": [
+        [
+          {
+            "node": "02 | Input Normalizer & Validator",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "02 | Input Normalizer & Validator": {
+      "main": [
+        [
+          {
+            "node": "03 | Upsert Client Record",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "03 | Upsert Client Record": {
+      "main": [
+        [
+          {
+            "node": "04 | Fetch Vendor Rates from DB",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "04 | Fetch Vendor Rates from DB": {
+      "main": [
+        [
+          {
+            "node": "05 | Rate Aggregator",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "05 | Rate Aggregator": {
+      "main": [
+        [
+          {
+            "node": "06 | Replicate Itinerary Generator",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "08 | Itinerary Parser & Validator": {
+      "main": [
+        [
+          {
+            "node": "09 | Pricing Engine",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "09 | Pricing Engine": {
+      "main": [
+        [
+          {
+            "node": "10 | Fetch Active Vendors",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "18 | HTML Proposal Builder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "10 | Fetch Active Vendors": {
+      "main": [
+        [
+          {
+            "node": "11 | RFQ Email Builder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "11 | RFQ Email Builder": {
+      "main": [
+        [
+          {
+            "node": "12 | Skip RFQ Check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "12 | Skip RFQ Check": {
+      "main": [
+        [
+          {
+            "node": "13 | Send RFQ Emails",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "13 | Send RFQ Emails": {
+      "main": [
+        [
+          {
+            "node": "14 | Wait 24h (Vendor SLA)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "14 | Wait 24h (Vendor SLA)": {
+      "main": [
+        [
+          {
+            "node": "15 | Check RFQ Response in DB",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "15 | Check RFQ Response in DB": {
+      "main": [
+        [
+          {
+            "node": "16 | Vendor Responded?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "16 | Vendor Responded?": {
+      "main": [
+        [
+          {
+            "node": "17 | Send RFQ Follow-up",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "18 | HTML Proposal Builder": {
+      "main": [
+        [
+          {
+            "node": "19 | PDF Generator",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "19 | PDF Generator": {
+      "main": [
+        [
+          {
+            "node": "20 | Client Proposal Email",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "25 | Error Handler",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "20 | Client Proposal Email": {
+      "main": [
+        [
+          {
+            "node": "21 | Insert Quote to DB",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "25 | Error Handler",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "21 | Insert Quote to DB": {
+      "main": [
+        [
+          {
+            "node": "22 | Initialize Booking Record",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "22 | Initialize Booking Record": {
+      "main": [
+        [
+          {
+            "node": "23 | Audit Log — Success",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "23 | Audit Log — Success": {
+      "main": [
+        [
+          {
+            "node": "24 | Webhook Response — Success",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "25 | Error Handler": {
+      "main": [
+        [
+          {
+            "node": "26 | Log Error to DB",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "26 | Log Error to DB": {
+      "main": [
+        [
+          {
+            "node": "27 | Admin Alert Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "27 | Admin Alert Email": {
+      "main": [
+        [
+          {
+            "node": "28 | Webhook Response — Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait": {
+      "main": [
+        [
+          {
+            "node": "Poll",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If": {
+      "main": [
+        [
+          {
+            "node": "07 | Replicate Error Check",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Wait",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "06 | Replicate Itinerary Generator": {
+      "main": [
+        [
+          {
+            "node": "Wait",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Poll": {
+      "main": [
+        [
+          {
+            "node": "If",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "07 | Replicate Error Check": {
+      "main": [
+        [
+          {
+            "node": "25 | Error Handler",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "08 | Itinerary Parser & Validator",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "availableInMCP": false
+  },
+  "versionId": "105cefc5-cc81-4cc3-a265-a17c5f24a467",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "3cb7bb455a7b489f23a2b89fe654a70269452b7e76b096aa30ce474ef6c32033"
+  },
+  "id": "WhMuX9wN1dA9tRmeP1E1L",
+  "tags": []
+}
